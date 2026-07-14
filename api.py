@@ -98,15 +98,34 @@ def _fetch_adjusted_close(ticker: str) -> pd.Series:
             progress=False,
         )
     except Exception as exc:
+        # The user-facing ValueError below stays generic; this is the only
+        # place the real exception type/message/status reaches a log.
+        logger.exception("yf.download raised for %s: %s: %s", ticker, type(exc).__name__, exc)
         raise ValueError(f"Invalid ticker symbol or no data available for: {ticker}") from exc
 
     if history.empty or "Adj Close" not in history.columns.get_level_values(0):
+        # No exception — distinct from the case above: this is Yahoo
+        # returning a "successful" (HTTP 200) response with no usable rows,
+        # e.g. a soft rate-limit/block rather than a thrown 429/403.
+        logger.error(
+            "yf.download returned no usable data for %s with no exception raised "
+            "(empty=%s, columns=%s)",
+            ticker,
+            history.empty,
+            list(history.columns),
+        )
         raise ValueError(f"Invalid ticker symbol or no data available for: {ticker}")
 
     adj_close = history["Adj Close"]
     series = (adj_close.iloc[:, 0] if isinstance(adj_close, pd.DataFrame) else adj_close).dropna()
 
     if series.empty:
+        logger.error(
+            "yf.download returned rows for %s but 'Adj Close' was entirely NaN after dropna "
+            "(no exception raised, columns=%s)",
+            ticker,
+            list(history.columns),
+        )
         raise ValueError(f"Invalid ticker symbol or no data available for: {ticker}")
 
     series.name = ticker
