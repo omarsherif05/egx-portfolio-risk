@@ -17,9 +17,10 @@ structured JSON response.
 
 from __future__ import annotations
 
-import concurrent.futures
 import logging
 import os
+import tempfile
+import time
 from typing import Dict, List
 
 import numpy as np
@@ -30,6 +31,11 @@ from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field, model_validator
+
+try:
+    from yfinance.exceptions import YFRateLimitError
+except ImportError:  # older/newer yfinance without this exception type
+    YFRateLimitError = None
 
 from egx30_benchmark import get_egx30
 from finance_math import (
@@ -48,6 +54,14 @@ from finance_math import (
 logger = logging.getLogger("portfolio_risk_api")
 logging.basicConfig(level=logging.INFO)
 
+# yfinance's default tz/cookie cache directory (platformdirs' user_cache_dir)
+# isn't guaranteed writable on Render, which logged: Failed to create
+# TzCache... '/opt/render/.cache/py-yfinance' [Errno 17] File exists. Point
+# it at a location we know is writable, before any yf.download() call.
+_YFINANCE_CACHE_DIR = os.path.join(tempfile.gettempdir(), "py-yfinance-cache")
+os.makedirs(_YFINANCE_CACHE_DIR, exist_ok=True)
+yf.set_tz_cache_location(_YFINANCE_CACHE_DIR)
+
 # --------------------------------------------------------------------------
 # Market data configuration
 # --------------------------------------------------------------------------
@@ -57,6 +71,35 @@ MARKET_TICKER = "EGX30"
 LOOKBACK_PERIOD = "3y"
 TRADING_DAYS_PER_YEAR = 252
 MIN_OBSERVATIONS = 60
+
+# Yahoo rate-limits bursts of concurrent requests from a fresh datacenter IP
+# (confirmed via Render logs: YFRateLimitError - "Too Many Requests. Rate
+# limited. Try after a while."). _fetch_price_history therefore fetches
+# tickers SEQUENTIALLY with a pause between them, and each individual fetch
+# retries with exponential backoff specifically on a rate-limit response.
+INTER_TICKER_DELAY_SECONDS = 1.5
+RATE_LIMIT_MAX_RETRIES = 4
+RATE_LIMIT_BASE_DELAY_SECONDS = 2.0
+
+
+class RateLimitedError(Exception):
+    """Yahoo Finance rate-limited a ticker fetch even after retrying with
+    backoff. Distinct from an invalid ticker: the symbol is fine, the
+    request just needs to happen later."""
+
+
+def _is_rate_limit_error(exc: Exception) -> bool:
+    """True if `exc` represents a Yahoo rate-limit response.
+
+    Checked by type when yfinance exposes YFRateLimitError; otherwise (or
+    in addition, since yfinance sometimes wraps it) by message content —
+    yfinance's own rate-limit message is literally "Too Many Requests.
+    Rate limited. Try after a while."
+    """
+    if YFRateLimitError is not None and isinstance(exc, YFRateLimitError):
+        return True
+    message = str(exc).lower()
+    return "rate limit" in message or "too many requests" in message
 
 
 def _format_egx_ticker(ticker: str) -> str:
@@ -80,6 +123,10 @@ def _format_egx_ticker(ticker: str) -> str:
 def _fetch_adjusted_close(ticker: str) -> pd.Series:
     """Fetch 3 years of daily 'Adj Close' history for a single ticker.
 
+    Retries with exponential backoff specifically when Yahoo responds with
+    a rate limit (see RATE_LIMIT_MAX_RETRIES) — any other exception (e.g. a
+    genuinely invalid ticker) is raised immediately, not retried.
+
     Args:
         ticker: Yahoo Finance-compatible symbol to fetch.
 
@@ -89,19 +136,48 @@ def _fetch_adjusted_close(ticker: str) -> pd.Series:
     Raises:
         ValueError: if yfinance returns no usable data for the ticker
             (invalid symbol, delisted, or a transient fetch failure).
+        RateLimitedError: if Yahoo is still rate-limiting this ticker after
+            RATE_LIMIT_MAX_RETRIES retries.
     """
-    try:
-        history = yf.download(
-            ticker,
-            period=LOOKBACK_PERIOD,
-            auto_adjust=False,
-            progress=False,
-        )
-    except Exception as exc:
-        # The user-facing ValueError below stays generic; this is the only
-        # place the real exception type/message/status reaches a log.
-        logger.exception("yf.download raised for %s: %s: %s", ticker, type(exc).__name__, exc)
-        raise ValueError(f"Invalid ticker symbol or no data available for: {ticker}") from exc
+    history = None
+    for attempt in range(RATE_LIMIT_MAX_RETRIES + 1):
+        try:
+            history = yf.download(
+                ticker,
+                period=LOOKBACK_PERIOD,
+                auto_adjust=False,
+                progress=False,
+            )
+            break
+        except Exception as exc:
+            # The user-facing message below stays generic/specific by case;
+            # this is the only place the real exception type/message/status
+            # reaches a log.
+            logger.exception(
+                "yf.download raised for %s (attempt %d/%d): %s: %s",
+                ticker,
+                attempt + 1,
+                RATE_LIMIT_MAX_RETRIES + 1,
+                type(exc).__name__,
+                exc,
+            )
+            if _is_rate_limit_error(exc):
+                if attempt < RATE_LIMIT_MAX_RETRIES:
+                    delay = RATE_LIMIT_BASE_DELAY_SECONDS * (2 ** attempt)
+                    logger.warning(
+                        "Rate limited fetching %s — retrying in %.1fs (attempt %d/%d)",
+                        ticker,
+                        delay,
+                        attempt + 1,
+                        RATE_LIMIT_MAX_RETRIES,
+                    )
+                    time.sleep(delay)
+                    continue
+                raise RateLimitedError(
+                    f"Yahoo Finance is rate-limiting requests for '{ticker}' right now. "
+                    "Please wait a moment and try again."
+                ) from exc
+            raise ValueError(f"Invalid ticker symbol or no data available for: {ticker}") from exc
 
     if history.empty or "Adj Close" not in history.columns.get_level_values(0):
         # No exception — distinct from the case above: this is Yahoo
@@ -133,10 +209,16 @@ def _fetch_adjusted_close(ticker: str) -> pd.Series:
 
 
 def _fetch_price_history(tickers: List[str]) -> Dict[str, pd.Series]:
-    """Fetch adjusted-close history for multiple tickers concurrently.
+    """Fetch adjusted-close history for multiple tickers SEQUENTIALLY.
+
+    Previously fetched all tickers concurrently via ThreadPoolExecutor, which
+    tripped Yahoo's rate limiter almost immediately from a fresh datacenter
+    IP (confirmed via Render logs). Fetching one at a time, paced by
+    INTER_TICKER_DELAY_SECONDS, trades latency for reliability under that
+    limiter — see _fetch_adjusted_close for the per-ticker retry/backoff.
 
     Args:
-        tickers: Yahoo Finance-compatible symbols to fetch in parallel.
+        tickers: Yahoo Finance-compatible symbols to fetch in order.
 
     Returns:
         Dict mapping each ticker to its adjusted-close price Series.
@@ -144,13 +226,14 @@ def _fetch_price_history(tickers: List[str]) -> Dict[str, pd.Series]:
     Raises:
         ValueError: propagated from `_fetch_adjusted_close` if any ticker
             has no usable data.
+        RateLimitedError: propagated from `_fetch_adjusted_close` if a
+            ticker is still rate-limited after all retries.
     """
     results: Dict[str, pd.Series] = {}
-    with concurrent.futures.ThreadPoolExecutor(max_workers=min(8, len(tickers))) as executor:
-        future_to_ticker = {executor.submit(_fetch_adjusted_close, t): t for t in tickers}
-        for future in concurrent.futures.as_completed(future_to_ticker):
-            ticker = future_to_ticker[future]
-            results[ticker] = future.result()
+    for i, ticker in enumerate(tickers):
+        results[ticker] = _fetch_adjusted_close(ticker)
+        if i < len(tickers) - 1:
+            time.sleep(INTER_TICKER_DELAY_SECONDS)
     return results
 
 
@@ -276,6 +359,14 @@ async def value_error_handler(request: Request, exc: ValueError) -> JSONResponse
     return JSONResponse(
         status_code=400,
         content={"error": "InvalidComputationInput", "detail": str(exc)},
+    )
+
+
+@app.exception_handler(RateLimitedError)
+async def rate_limited_error_handler(request: Request, exc: RateLimitedError) -> JSONResponse:
+    return JSONResponse(
+        status_code=429,
+        content={"error": "RateLimited", "detail": str(exc)},
     )
 
 
