@@ -1,0 +1,10 @@
+.venv/
+venv/
+__pycache__/
+*.pyc
+.env
+.env.local
+node_modules/
+.next/
+*.log
+data/egx30.csv
