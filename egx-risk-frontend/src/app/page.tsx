@@ -55,7 +55,7 @@ type RunInputs = {
 
 type BetaRow = { ticker: string; weight: number; beta: number };
 
-const API_URL = "http://127.0.0.1:8000/api/v1/analyze-portfolio";
+const API_URL = process.env.NEXT_PUBLIC_API_URL ?? "http://127.0.0.1:8000/api/v1/analyze-portfolio";
 const WEIGHT_TOLERANCE = 0.01;
 const REQUEST_TIMEOUT_MS = 30_000;
 const EGX_SUFFIX = ".CA";

@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import concurrent.futures
 import logging
+import os
 from typing import Dict, List
 
 import numpy as np
@@ -231,9 +232,16 @@ app = FastAPI(
     version="2.0.0",
 )
 
+_default_allowed_origins = "http://localhost:3000"
+_allowed_origins = [
+    origin.strip()
+    for origin in os.environ.get("ALLOWED_ORIGINS", _default_allowed_origins).split(",")
+    if origin.strip()
+]
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000"],
+    allow_origins=_allowed_origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
