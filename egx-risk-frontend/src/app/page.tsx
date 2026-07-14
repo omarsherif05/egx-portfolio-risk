@@ -1,6 +1,6 @@
 "use client";
 
-import { useId, useRef, useState } from "react";
+import { useEffect, useId, useRef, useState } from "react";
 import {
   Plus,
   Trash2,
@@ -10,6 +10,8 @@ import {
   CircleX,
   Wand2,
   Pencil,
+  Copy,
+  Check,
 } from "lucide-react";
 import { InfoTooltip, type InfoTooltipContent } from "./InfoTooltip";
 
@@ -57,6 +59,8 @@ const API_URL = "http://127.0.0.1:8000/api/v1/analyze-portfolio";
 const WEIGHT_TOLERANCE = 0.01;
 const REQUEST_TIMEOUT_MS = 30_000;
 const EGX_SUFFIX = ".CA";
+
+const LOADING_STEPS = ["Fetching price history…", "Aligning trading calendars…", "Computing risk metrics…"];
 
 const INITIAL_ASSETS: Asset[] = [
   { id: "COMI", ticker: "COMI", weight: "40" },
@@ -382,25 +386,144 @@ function ScoreCard({
   digits = 2,
   percent = false,
   tooltip,
+  emphasis = false,
 }: {
   label: string;
   value: number | null | undefined;
   digits?: number;
   percent?: boolean;
   tooltip?: InfoTooltipContent;
+  emphasis?: boolean;
 }) {
   const isKnown = value !== null && value !== undefined;
   const displayValue = isKnown && percent ? value * 100 : value;
   return (
-    <div className="rounded-xl border border-slate-200 bg-white p-5 shadow-sm dark:border-neutral-800 dark:bg-neutral-900">
+    <div
+      className={`rounded-xl border bg-white p-5 shadow-sm dark:bg-neutral-900 ${
+        emphasis ? "border-slate-300 dark:border-neutral-700" : "border-slate-200 dark:border-neutral-800"
+      }`}
+    >
       <p className="flex items-center text-xs font-medium uppercase tracking-wide text-slate-500 dark:text-neutral-400">
         {label}
         {tooltip && <InfoTooltip content={tooltip} />}
       </p>
-      <p className="mt-2 text-2xl font-semibold tabular-nums text-slate-900 dark:text-neutral-50">
+      <p
+        className={`mt-2 tabular-nums text-slate-900 dark:text-neutral-50 ${
+          emphasis ? "text-3xl font-bold" : "text-2xl font-semibold"
+        }`}
+      >
         {formatNumber(displayValue, digits)}
         {isKnown && percent ? "%" : ""}
       </p>
+    </div>
+  );
+}
+
+function pctText(value: number | null | undefined, digits = 2): string {
+  if (!isFiniteNumber(value)) return "N/A";
+  return `${formatNumber(value * 100, digits)}%`;
+}
+
+// Plain-text summary for the "Copy results" button — no markdown, so it
+// pastes cleanly into an email or document. Padded labels give a readable
+// column alignment in a monospace or proportional font alike.
+function buildResultsSummaryText(
+  result: AnalysisResult,
+  riskFreeRatePct: number,
+  thresholdReturnPct: number,
+  systematicRiskPct: number | undefined,
+  unsystematicRiskPct: number | undefined,
+  interpretation: string[],
+): string {
+  const pad = (label: string) => label.padEnd(26, " ");
+  const lines: string[] = [];
+
+  lines.push("PORTFOLIO RISK ANALYSIS");
+  lines.push("");
+  lines.push("Portfolio");
+  result.tickers.forEach((ticker, i) => {
+    lines.push(`  ${pad(ticker)}${formatNumber((result.weights[i] ?? 0) * 100, 2)}%`);
+  });
+  lines.push("");
+  lines.push("Parameters");
+  lines.push(`  ${pad("Risk-Free Rate (Rf)")}${formatNumber(riskFreeRatePct, 2)}%`);
+  lines.push(`  ${pad("Threshold Return (Rl)")}${formatNumber(thresholdReturnPct, 2)}%`);
+  lines.push("");
+  lines.push("Data");
+  lines.push(`  ${pad("Observations")}${result.observations}`);
+  lines.push(`  ${pad("Period")}${result.period_start} to ${result.period_end}`);
+  lines.push("");
+  lines.push("Metrics");
+  lines.push(`  ${pad("Sharpe Ratio")}${formatNumber(result.risk_adjusted_metrics?.sharpe_ratio)}`);
+  lines.push(`  ${pad("Treynor Ratio")}${formatNumber(result.risk_adjusted_metrics?.treynor_ratio, 4)}`);
+  lines.push(`  ${pad("Portfolio Beta")}${formatNumber(result.risk_decomposition?.portfolio_beta)}`);
+  lines.push(`  ${pad("Jensen's Alpha")}${pctText(result.risk_adjusted_metrics?.jensens_alpha)}`);
+  lines.push(`  ${pad("M2 Measure")}${pctText(result.risk_adjusted_metrics?.m2_measure)}`);
+  lines.push(`  ${pad("Expected Return")}${pctText(result.portfolio_expected_return)}`);
+  lines.push(`  ${pad("Portfolio Volatility")}${pctText(result.portfolio_volatility)}`);
+  lines.push(`  ${pad("Market Volatility")}${pctText(result.market_volatility)}`);
+  lines.push(`  ${pad("Systematic Risk")}${formatNumber(systematicRiskPct)}%`);
+  lines.push(`  ${pad("Unsystematic Risk")}${formatNumber(unsystematicRiskPct)}%`);
+  lines.push(`  ${pad("Roy's Safety-First Ratio")}${formatNumber(result.roys_safety_first_ratio, 4)}`);
+  lines.push(`  ${pad("Threshold Cleared")}${result.threshold_cleared ? "Yes" : "No"}`);
+  lines.push("");
+  lines.push("What this means");
+  interpretation.forEach((sentence) => lines.push(`  ${sentence}`));
+
+  return lines.join("\n");
+}
+
+// navigator.clipboard requires a secure context and can be blocked outright
+// in some browsers; execCommand is a deprecated but still-working fallback
+// for the same user gesture.
+async function copyTextToClipboard(text: string): Promise<boolean> {
+  try {
+    if (navigator.clipboard && window.isSecureContext) {
+      await navigator.clipboard.writeText(text);
+      return true;
+    }
+    throw new Error("Clipboard API unavailable");
+  } catch {
+    try {
+      const textarea = document.createElement("textarea");
+      textarea.value = text;
+      textarea.style.position = "fixed";
+      textarea.style.opacity = "0";
+      document.body.appendChild(textarea);
+      textarea.focus();
+      textarea.select();
+      const succeeded = document.execCommand("copy");
+      document.body.removeChild(textarea);
+      return succeeded;
+    } catch {
+      return false;
+    }
+  }
+}
+
+// Mounted fresh each time the loading overlay appears (via its parent's
+// `{loading && ...}` conditional), so its own step index naturally starts
+// at 0 without needing an effect to reset state imperatively.
+function LoadingStepLabel() {
+  const [step, setStep] = useState(0);
+  useEffect(() => {
+    const interval = setInterval(() => {
+      setStep((prev) => (prev < LOADING_STEPS.length - 1 ? prev + 1 : prev));
+    }, 800);
+    return () => clearInterval(interval);
+  }, []);
+  return <p className="text-sm font-medium text-slate-500 dark:text-neutral-400">{LOADING_STEPS[step]}</p>;
+}
+
+function EmptyResultsState() {
+  return (
+    <div className="rounded-xl border border-slate-200 bg-white p-5 shadow-sm dark:border-neutral-800 dark:bg-neutral-900">
+      <h3 className="text-sm font-semibold text-slate-900 dark:text-neutral-50">What this engine does</h3>
+      <div className="mt-3 flex flex-col gap-2 text-sm leading-relaxed text-slate-500 dark:text-neutral-400">
+        <p>Fetches three years of daily prices for your holdings from Yahoo Finance, and the EGX30 index from Investing.com.</p>
+        <p>Aligns both onto a strict shared trading calendar — no forward-filling, no invented prices.</p>
+        <p>Computes covariance, beta, and CAPM risk-adjusted performance, and tells you in plain English what the numbers mean.</p>
+      </div>
     </div>
   );
 }
@@ -416,6 +539,8 @@ function ResultsSection({
   interpretation,
   resultsAreStale,
   isCollapsed,
+  riskFreeRatePct,
+  thresholdReturnPct,
 }: {
   result: AnalysisResult;
   betaRows: BetaRow[];
@@ -424,7 +549,25 @@ function ResultsSection({
   interpretation: string[];
   resultsAreStale: boolean;
   isCollapsed: boolean;
+  riskFreeRatePct: number;
+  thresholdReturnPct: number;
 }) {
+  const [copyState, setCopyState] = useState<"idle" | "copied" | "failed">("idle");
+
+  async function handleCopy() {
+    const text = buildResultsSummaryText(
+      result,
+      riskFreeRatePct,
+      thresholdReturnPct,
+      systematicRiskPct,
+      unsystematicRiskPct,
+      interpretation,
+    );
+    const succeeded = await copyTextToClipboard(text);
+    setCopyState(succeeded ? "copied" : "failed");
+    setTimeout(() => setCopyState("idle"), 2000);
+  }
+
   const scoreCardGridClass = isCollapsed
     ? "grid grid-cols-2 gap-4 md:grid-cols-3 lg:grid-cols-4"
     : "grid grid-cols-1 gap-4 sm:grid-cols-2";
@@ -536,6 +679,17 @@ function ResultsSection({
 
   return (
     <section className="flex flex-col gap-6">
+      <div className="flex justify-end">
+        <button
+          type="button"
+          onClick={handleCopy}
+          className="flex items-center gap-1.5 rounded-md border border-slate-300 px-2.5 py-1.5 text-xs font-medium text-slate-700 hover:bg-slate-50 dark:border-neutral-700 dark:text-neutral-300 dark:hover:bg-neutral-800"
+        >
+          {copyState === "copied" ? <Check className="h-3.5 w-3.5" /> : <Copy className="h-3.5 w-3.5" />}
+          {copyState === "copied" ? "Copied" : copyState === "failed" ? "Copy failed" : "Copy results"}
+        </button>
+      </div>
+
       {resultsAreStale && (
         <div className="rounded-md bg-amber-50 px-3 py-2 text-xs font-medium text-amber-800 dark:bg-amber-950/40 dark:text-amber-300">
           Inputs changed — re-run analysis
@@ -567,19 +721,30 @@ function ResultsSection({
         )}
 
         <div className={scoreCardGridClass}>
-          <ScoreCard label="Sharpe Ratio" value={result.risk_adjusted_metrics?.sharpe_ratio} tooltip={METRIC_TOOLTIPS.sharpe} />
+          <ScoreCard
+            label="Sharpe Ratio"
+            value={result.risk_adjusted_metrics?.sharpe_ratio}
+            tooltip={METRIC_TOOLTIPS.sharpe}
+            emphasis
+          />
           <ScoreCard
             label="Treynor Ratio"
             value={result.risk_adjusted_metrics?.treynor_ratio}
             digits={4}
             tooltip={METRIC_TOOLTIPS.treynor}
           />
-          <ScoreCard label="Portfolio Beta" value={result.risk_decomposition?.portfolio_beta} tooltip={METRIC_TOOLTIPS.beta} />
+          <ScoreCard
+            label="Portfolio Beta"
+            value={result.risk_decomposition?.portfolio_beta}
+            tooltip={METRIC_TOOLTIPS.beta}
+            emphasis
+          />
           <ScoreCard
             label="Jensen's Alpha"
             value={result.risk_adjusted_metrics?.jensens_alpha}
             percent
             tooltip={METRIC_TOOLTIPS.alpha}
+            emphasis
           />
           <ScoreCard label="Portfolio Volatility" value={result.portfolio_volatility} percent tooltip={METRIC_TOOLTIPS.portfolioVolatility} />
           <ScoreCard label="Market Volatility" value={result.market_volatility} percent tooltip={METRIC_TOOLTIPS.marketVolatility} />
@@ -806,8 +971,9 @@ export default function Home() {
   const formSection = (
     <section className="relative flex flex-col gap-6">
       {loading && (
-        <div className="absolute inset-0 z-10 flex items-center justify-center rounded-xl bg-white/70 backdrop-blur-sm dark:bg-neutral-950/70">
+        <div className="absolute inset-0 z-10 flex flex-col items-center justify-center gap-3 rounded-xl bg-white/70 backdrop-blur-sm dark:bg-neutral-950/70">
           <LoaderCircle className="h-8 w-8 animate-spin text-slate-500 dark:text-neutral-400" />
+          <LoadingStepLabel />
         </div>
       )}
 
@@ -960,7 +1126,7 @@ export default function Home() {
     </section>
   );
 
-  const resultsSection = result && (
+  const resultsSection = result ? (
     <ResultsSection
       result={result}
       betaRows={betaRows}
@@ -969,7 +1135,11 @@ export default function Home() {
       interpretation={interpretation}
       resultsAreStale={resultsAreStale}
       isCollapsed={isCollapsed}
+      riskFreeRatePct={summaryRf}
+      thresholdReturnPct={summaryThreshold}
     />
+  ) : (
+    <EmptyResultsState />
   );
 
   return (
