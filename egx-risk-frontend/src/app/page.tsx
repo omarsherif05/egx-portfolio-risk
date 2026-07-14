@@ -145,6 +145,20 @@ const METRIC_TOOLTIPS: Record<string, InfoTooltipContent> = {
     reading:
       "A high number means your portfolio is concentrated. This is the risk you are NOT compensated for taking, because you could have removed it for free by diversifying.",
   },
+  riskFreeRateInput: {
+    title: "Risk-Free Rate",
+    definition:
+      "The return you could earn with essentially no risk at all. It is the baseline every risky investment has to beat — if a stock portfolio can't outperform it, you were never being paid for the risk you took.",
+    reading:
+      "What to enter: In Egypt, use the yield on short-term Egyptian Treasury bills (T-bills), issued by the Ministry of Finance and auctioned weekly by the Central Bank. As of recent years these have ranged roughly between 18% and 27% depending on the rate cycle. Enter it as an annual percentage — for example, 18 for an 18% T-bill yield. Why it matters: Rf sits inside Sharpe, Treynor, Jensen's Alpha, and M². Egypt's risk-free rate is unusually high by global standards — an 18% T-bill is a serious hurdle that a US investor comparing against a 4% Treasury never has to clear. A portfolio returning 20% a year is impressive in New York and merely adequate in Cairo.",
+  },
+  thresholdReturnInput: {
+    title: "Threshold Return",
+    definition:
+      "The minimum return you can live with. Not your target, and not your hope — the floor below which the outcome counts as a failure for you.",
+    reading:
+      'What to enter: Whatever a bad year actually means for you, as an annual percentage. Two common ways to set it: your risk-free rate, meaning "if I can\'t beat T-bills, I should have just bought T-bills"; or Egypt\'s inflation rate, meaning "if I don\'t beat inflation, I lost purchasing power even though the number went up." Why it matters: This is the only input on this page that is a personal judgement rather than a market fact. It feeds Roy\'s Safety-First Ratio, which measures how far your expected return sits above this floor and estimates the chance of falling below it. Setting the threshold BELOW your risk-free rate is irrational — it would mean accepting less than cash pays — which is why this page warns you when you do.',
+  },
 };
 
 function formatNumber(value: number | null | undefined, digits = 2) {
@@ -982,7 +996,11 @@ export default function Home() {
           <h2 className="text-sm font-semibold text-slate-900 dark:text-neutral-50">Global Parameters</h2>
           <div className="mt-4 grid grid-cols-1 gap-4 sm:grid-cols-2">
             <label className="flex flex-col gap-1.5 text-sm">
-              <span className="text-slate-600 dark:text-neutral-400">Risk-Free Rate (Rf) %</span>
+              <span className="flex items-center text-slate-600 dark:text-neutral-400">
+                Risk-Free Rate (Rf)
+                <InfoTooltip content={METRIC_TOOLTIPS.riskFreeRateInput} />
+                {" %"}
+              </span>
               <input
                 type="text"
                 inputMode="decimal"
@@ -995,7 +1013,11 @@ export default function Home() {
               />
             </label>
             <label className="flex flex-col gap-1.5 text-sm">
-              <span className="text-slate-600 dark:text-neutral-400">Threshold Return (Rl) %</span>
+              <span className="flex items-center text-slate-600 dark:text-neutral-400">
+                Threshold Return (Rl)
+                <InfoTooltip content={METRIC_TOOLTIPS.thresholdReturnInput} />
+                {" %"}
+              </span>
               <input
                 type="text"
                 inputMode="decimal"

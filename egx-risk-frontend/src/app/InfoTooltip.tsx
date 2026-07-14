@@ -6,7 +6,7 @@ import { createPortal } from "react-dom";
 export type InfoTooltipContent = {
   title: string;
   definition: string;
-  formula: string;
+  formula?: string;
   reading: string;
 };
 
@@ -127,9 +127,11 @@ export function InfoTooltip({ content }: { content: InfoTooltipContent }) {
           >
             <p className="font-semibold text-slate-900 dark:text-neutral-50">{content.title}</p>
             <p className="mt-1.5 text-slate-600 dark:text-neutral-400">{content.definition}</p>
-            <p className="mt-2 rounded-md bg-slate-50 px-2 py-1.5 font-mono text-[11px] text-slate-800 dark:bg-neutral-800 dark:text-neutral-200">
-              {content.formula}
-            </p>
+            {content.formula && (
+              <p className="mt-2 rounded-md bg-slate-50 px-2 py-1.5 font-mono text-[11px] text-slate-800 dark:bg-neutral-800 dark:text-neutral-200">
+                {content.formula}
+              </p>
+            )}
             <p className="mt-2 text-slate-600 dark:text-neutral-400">{content.reading}</p>
           </div>,
           document.body,
