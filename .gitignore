@@ -7,4 +7,10 @@ __pycache__/
 node_modules/
 .next/
 *.log
-data/egx30.csv
+
+# data/egx30.csv is INTENTIONALLY tracked, not ignored. It is a seed/
+# fallback cache for egx30_benchmark.py, not user data: on a cold start
+# (e.g. Render's ephemeral filesystem) with no cache present, a blocked
+# or failed download raises RuntimeError with nothing to fall back to.
+# The committed file is a floor, not a source of truth — it gets
+# overwritten on the first successful refresh.
