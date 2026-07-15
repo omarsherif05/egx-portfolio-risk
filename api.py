@@ -328,11 +328,19 @@ PREWARM_TICKERS = [
     "SKPC", "AMOC", "PHDC", "ORWE", "EKHO", "HELI", "MNHD", "OCDI", "CIEB", "CLHO",
     "ISPH", "EGCH", "SUGR", "JUFO", "EFIC",
 ]
-PREWARM_INTER_TICKER_DELAY_SECONDS = 3.0
+# A cold datacenter IP trips Yahoo's rate limiter fastest right after boot
+# and under tight spacing (confirmed on Render: pre-warm hit "Too Many
+# Requests" on its very first ticker, while a normal request minutes later
+# succeeded). PREWARM_STARTUP_DELAY_SECONDS lets the app finish coming up
+# before pre-warm fetches anything, and the wider per-ticker spacing gives
+# Yahoo's limiter more room — latency doesn't matter for a background task.
+PREWARM_STARTUP_DELAY_SECONDS = 30.0
+PREWARM_INTER_TICKER_DELAY_SECONDS = 8.0
 
 
 async def _prewarm_price_cache() -> None:
-    """Fetch PREWARM_TICKERS one at a time into the price cache.
+    """Wait PREWARM_STARTUP_DELAY_SECONDS, then fetch PREWARM_TICKERS one at
+    a time into the price cache.
 
     Never allowed to affect app startup or availability: an individual
     ticker's failure is caught and logged so the rest of the list still
@@ -344,6 +352,16 @@ async def _prewarm_price_cache() -> None:
     event loop that's meant to be serving requests during this window.
     """
     try:
+        await asyncio.sleep(PREWARM_STARTUP_DELAY_SECONDS)
+
+        estimated_minutes = (len(PREWARM_TICKERS) * PREWARM_INTER_TICKER_DELAY_SECONDS) / 60.0
+        logger.info(
+            "Pre-warm starting, will take ~%.1f minutes (%d tickers, %.0fs apart)",
+            estimated_minutes,
+            len(PREWARM_TICKERS),
+            PREWARM_INTER_TICKER_DELAY_SECONDS,
+        )
+
         warmed, failed = 0, 0
         for ticker in PREWARM_TICKERS:
             formatted = _format_egx_ticker(ticker)
