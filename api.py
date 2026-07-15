@@ -487,7 +487,7 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
-_default_allowed_origins = "http://localhost:3000"
+_default_allowed_origins = "http://localhost:3000,https://egx-portfolio-risk.vercel.app"
 _allowed_origins = [
     origin.strip()
     for origin in os.environ.get("ALLOWED_ORIGINS", _default_allowed_origins).split(",")
@@ -497,6 +497,10 @@ _allowed_origins = [
 app.add_middleware(
     CORSMiddleware,
     allow_origins=_allowed_origins,
+    # Vercel preview deployments get random subdomains (e.g.
+    # egx-portfolio-risk-git-foo-<user>.vercel.app), so the exact-match
+    # allow_origins list above can't cover them.
+    allow_origin_regex=r"https://egx-portfolio-risk.*\.vercel\.app",
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
