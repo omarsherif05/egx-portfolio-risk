@@ -17,11 +17,14 @@ structured JSON response.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 import tempfile
+import threading
 import time
-from typing import Dict, List
+from contextlib import asynccontextmanager
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
@@ -92,14 +95,56 @@ def _is_rate_limit_error(exc: Exception) -> bool:
     """True if `exc` represents a Yahoo rate-limit response.
 
     Checked by type when yfinance exposes YFRateLimitError; otherwise (or
-    in addition, since yfinance sometimes wraps it) by message content —
-    yfinance's own rate-limit message is literally "Too Many Requests.
-    Rate limited. Try after a while."
+    in addition, since yfinance sometimes wraps it) by an attached HTTP 429
+    status or by message content — yfinance's own rate-limit message is
+    literally "Too Many Requests. Rate limited. Try after a while.".
+    yfinance's internal request retry (data.py's _make_request) only raises
+    YFRateLimitError when a SECOND, strategy-switched attempt also comes
+    back exactly 429; a first-attempt 429 followed by a differently-shaped
+    failure (e.g. a plain HTTPError with no message match) is caught here
+    via .response.status_code instead.
     """
     if YFRateLimitError is not None and isinstance(exc, YFRateLimitError):
         return True
+    response = getattr(exc, "response", None)
+    if response is not None and getattr(response, "status_code", None) == 429:
+        return True
     message = str(exc).lower()
-    return "rate limit" in message or "too many requests" in message
+    return "rate limit" in message or "too many requests" in message or "429" in message
+
+
+# --------------------------------------------------------------------------
+# In-memory price cache
+# --------------------------------------------------------------------------
+# The retry/backoff above handles transient throttling within a single
+# request, but not a sustained cooldown — Yahoo can block a datacenter IP
+# for minutes after heavy use, and retrying inside one request can't wait
+# that out. The actual fix is to stop hitting Yahoo per-request at all for
+# tickers already fetched recently: cache each FORMATTED ticker's price
+# series for PRICE_CACHE_TTL_SECONDS, and pre-warm it at startup for the
+# most commonly analyzed EGX names (see _prewarm_price_cache below).
+
+PRICE_CACHE_TTL_SECONDS = 30 * 60
+
+_price_cache: Dict[str, Tuple[pd.Series, float]] = {}
+_price_cache_lock = threading.Lock()
+
+
+def _get_cached_price_series(ticker: str) -> Optional[pd.Series]:
+    """Return a cached price Series for `ticker` if present and within TTL."""
+    with _price_cache_lock:
+        entry = _price_cache.get(ticker)
+    if entry is None:
+        return None
+    series, cached_at = entry
+    if time.time() - cached_at > PRICE_CACHE_TTL_SECONDS:
+        return None
+    return series
+
+
+def _store_cached_price_series(ticker: str, series: pd.Series) -> None:
+    with _price_cache_lock:
+        _price_cache[ticker] = (series, time.time())
 
 
 def _format_egx_ticker(ticker: str) -> str:
@@ -135,11 +180,15 @@ def _fetch_adjusted_close(ticker: str) -> pd.Series:
 
     Raises:
         ValueError: if yfinance returns no usable data for the ticker
-            (invalid symbol, delisted, or a transient fetch failure).
+            (invalid symbol, delisted, or a transient fetch failure) and no
+            attempt along the way showed a rate-limit signal.
         RateLimitedError: if Yahoo is still rate-limiting this ticker after
-            RATE_LIMIT_MAX_RETRIES retries.
+            RATE_LIMIT_MAX_RETRIES retries, OR if any earlier attempt in
+            this call was rate-limited even if a later attempt in the same
+            call failed differently (see `ever_rate_limited` below).
     """
     history = None
+    ever_rate_limited = False
     for attempt in range(RATE_LIMIT_MAX_RETRIES + 1):
         try:
             history = yf.download(
@@ -161,18 +210,29 @@ def _fetch_adjusted_close(ticker: str) -> pd.Series:
                 type(exc).__name__,
                 exc,
             )
-            if _is_rate_limit_error(exc):
-                if attempt < RATE_LIMIT_MAX_RETRIES:
-                    delay = RATE_LIMIT_BASE_DELAY_SECONDS * (2 ** attempt)
-                    logger.warning(
-                        "Rate limited fetching %s — retrying in %.1fs (attempt %d/%d)",
-                        ticker,
-                        delay,
-                        attempt + 1,
-                        RATE_LIMIT_MAX_RETRIES,
-                    )
-                    time.sleep(delay)
-                    continue
+            is_rate_limited = _is_rate_limit_error(exc)
+            ever_rate_limited = ever_rate_limited or is_rate_limited
+            if is_rate_limited and attempt < RATE_LIMIT_MAX_RETRIES:
+                delay = RATE_LIMIT_BASE_DELAY_SECONDS * (2 ** attempt)
+                logger.warning(
+                    "Rate limited fetching %s — retrying in %.1fs (attempt %d/%d)",
+                    ticker,
+                    delay,
+                    attempt + 1,
+                    RATE_LIMIT_MAX_RETRIES,
+                )
+                time.sleep(delay)
+                continue
+            if ever_rate_limited:
+                # Either this attempt was rate-limited and retries are now
+                # exhausted, OR an earlier attempt in this same call was
+                # rate-limited and yfinance's internal cookie/crumb retry
+                # then failed differently on this attempt (its two-strategy
+                # dance only raises YFRateLimitError when the SECOND,
+                # switched-strategy attempt is also exactly 429 — a mid-
+                # cooldown response can easily not match that). Either way
+                # the root cause is Yahoo throttling this ticker, not an
+                # invalid symbol, so the user-facing error must say so.
                 raise RateLimitedError(
                     f"Yahoo Finance is rate-limiting requests for '{ticker}' right now. "
                     "Please wait a moment and try again."
@@ -209,13 +269,18 @@ def _fetch_adjusted_close(ticker: str) -> pd.Series:
 
 
 def _fetch_price_history(tickers: List[str]) -> Dict[str, pd.Series]:
-    """Fetch adjusted-close history for multiple tickers SEQUENTIALLY.
+    """Fetch adjusted-close history for multiple tickers, cache-first.
+
+    A cache hit (see PRICE_CACHE_TTL_SECONDS) skips Yahoo — and its rate
+    limiter — entirely for that ticker, including the inter-ticker pacing
+    delay. A cache miss falls back to the same sequential, paced,
+    retry-with-backoff fetch as before (see _fetch_adjusted_close); the
+    pacing delay only applies BETWEEN two consecutive live fetches, so a
+    cache hit never adds latency before or after it.
 
     Previously fetched all tickers concurrently via ThreadPoolExecutor, which
     tripped Yahoo's rate limiter almost immediately from a fresh datacenter
-    IP (confirmed via Render logs). Fetching one at a time, paced by
-    INTER_TICKER_DELAY_SECONDS, trades latency for reliability under that
-    limiter — see _fetch_adjusted_close for the per-ticker retry/backoff.
+    IP (confirmed via Render logs).
 
     Args:
         tickers: Yahoo Finance-compatible symbols to fetch in order.
@@ -230,11 +295,80 @@ def _fetch_price_history(tickers: List[str]) -> Dict[str, pd.Series]:
             ticker is still rate-limited after all retries.
     """
     results: Dict[str, pd.Series] = {}
-    for i, ticker in enumerate(tickers):
-        results[ticker] = _fetch_adjusted_close(ticker)
-        if i < len(tickers) - 1:
+    previous_was_live_fetch = False
+    for ticker in tickers:
+        cached = _get_cached_price_series(ticker)
+        if cached is not None:
+            results[ticker] = cached
+            previous_was_live_fetch = False
+            continue
+
+        if previous_was_live_fetch:
             time.sleep(INTER_TICKER_DELAY_SECONDS)
+
+        series = _fetch_adjusted_close(ticker)
+        _store_cached_price_series(ticker, series)
+        results[ticker] = series
+        previous_was_live_fetch = True
+
     return results
+
+
+# --------------------------------------------------------------------------
+# Startup pre-warm
+# --------------------------------------------------------------------------
+# Best-effort background warm of the price cache for the most-traded EGX
+# tickers, so the common case (someone analyzing a COMI/TMGH/HRHO-style
+# portfolio) skips Yahoo — and its rate limiter — entirely. Runs slowly
+# (PREWARM_INTER_TICKER_DELAY_SECONDS between calls) because it happens
+# once at startup and latency doesn't matter here, only reliability does.
+
+PREWARM_TICKERS = [
+    "COMI", "TMGH", "HRHO", "SWDY", "EAST", "EFIH", "ETEL", "ABUK", "ESRS", "MFPC",
+    "SKPC", "AMOC", "PHDC", "ORWE", "EKHO", "HELI", "MNHD", "OCDI", "CIEB", "CLHO",
+    "ISPH", "EGCH", "SUGR", "JUFO", "EFIC",
+]
+PREWARM_INTER_TICKER_DELAY_SECONDS = 3.0
+
+
+async def _prewarm_price_cache() -> None:
+    """Fetch PREWARM_TICKERS one at a time into the price cache.
+
+    Never allowed to affect app startup or availability: an individual
+    ticker's failure is caught and logged so the rest of the list still
+    gets a chance, and the whole function is wrapped so that even a total
+    failure (e.g. Yahoo mid-cooldown, every ticker fails) leaves the app to
+    start and serve requests normally — this is a best-effort optimization,
+    never a hard dependency. Each fetch runs in a worker thread via
+    asyncio.to_thread so its blocking retry/backoff sleeps don't stall the
+    event loop that's meant to be serving requests during this window.
+    """
+    try:
+        warmed, failed = 0, 0
+        for ticker in PREWARM_TICKERS:
+            formatted = _format_egx_ticker(ticker)
+            try:
+                series = await asyncio.to_thread(_fetch_adjusted_close, formatted)
+                _store_cached_price_series(formatted, series)
+                warmed += 1
+            except Exception as exc:
+                failed += 1
+                logger.warning("Pre-warm failed for %s: %s: %s", formatted, type(exc).__name__, exc)
+            await asyncio.sleep(PREWARM_INTER_TICKER_DELAY_SECONDS)
+        logger.info(
+            "Price cache pre-warm complete: %d/%d tickers warmed, %d failed",
+            warmed,
+            len(PREWARM_TICKERS),
+            failed,
+        )
+    except Exception:
+        logger.exception("Price cache pre-warm crashed; continuing without a warm cache.")
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    asyncio.create_task(_prewarm_price_cache())
+    yield
 
 
 # --------------------------------------------------------------------------
@@ -332,6 +466,7 @@ app = FastAPI(
     title="Portfolio Risk Analytics API",
     description="Vectorized N-asset portfolio risk analytics engine exposed over REST, backed by live EGX market data.",
     version="2.0.0",
+    lifespan=lifespan,
 )
 
 _default_allowed_origins = "http://localhost:3000"
